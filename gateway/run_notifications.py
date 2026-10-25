@@ -26,7 +26,7 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
-from gateway.run_notifications_busy_result import CarriedCompletion
+from gateway.run_notifications_busy_result import CarriedCompletion, GatewayBusyResultMixin
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -171,7 +171,9 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     return metadata
 
 
-class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin):
+class GatewayNotificationsMixin(
+    GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayBusyResultMixin,
+):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
@@ -1330,63 +1332,6 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         logger.info("Carrying async delegation %s into the running turn of %s",
                     claim.delegation_id or "<legacy>", evt.get("session_key"))
         return True
-
-    async def _settle_carried_completions(self, agent: Any = None, *, final: bool = False) -> None:
-        """Acknowledge completions a tool result carried; at turn end (``final``) hand the rest back
-        to the completion queue (claims deferred, no attempt spent) so they arrive as the next turn."""
-        try:
-            await self._settle_carried_completions_unguarded(agent, final=final)
-        except Exception:  # health: allow BLE001 -- runs in a turn's cleanup; the claim lease re-offers anything unsettled
-            logger.warning("Could not settle carried subagent completions", exc_info=True)
-
-    async def _settle_carried_completions_unguarded(self, agent: Any, *, final: bool) -> None:
-        from agent.background_results import take_delivered, take_outcome
-        agents = self.__dict__.get("_carrying_agents") or {}
-        if agent is not None and id(agent) not in agents:
-            return
-        for current in [agent] if agent is not None else list(agents.values()):
-            if final:
-                agents.pop(id(current), None)
-            # Settling an outcome can register a new carry: run_turn settles while the agent slot is
-            # still held, so a delivery landing now sees that agent and re-registers. Drain until
-            # quiet, bounded so a hot queue still ends.
-            for _ in range(64):
-                if final:
-                    delivered, undelivered = take_outcome(current)
-                else:
-                    delivered, undelivered = take_delivered(current), []
-                if not delivered and not undelivered:
-                    break
-                for carried in delivered:
-                    await self._settle_carried_completion(carried, "complete")
-                for carried, _text in undelivered:
-                    await self._settle_carried_completion(carried, "defer")
-
-    async def _settle_carried_completion(self, carried: CarriedCompletion, operation: str) -> None:
-        from tools.process_registry import process_registry as _pr
-        if carried.waiter is not None:  # a process completion: its waiting delivery call settles it
-            if not carried.waiter.done():
-                carried.waiter.set_result(operation == "complete")
-            return
-        async with self._completion_event_scope(carried.evt):
-            if carried.claim_id:
-                self._settle_durable_claim(operation, carried.delegation_id, carried.claim_id)
-            for sibling, claim_id in carried.siblings:
-                if claim_id:
-                    self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
-        if operation == "complete":
-            if carried.identity is not None:
-                with self._completion_delivery_lock:
-                    self._mark_completions_delivered_locked((carried.identity,))
-            if carried.siblings:
-                self._record_coalesced_completion_siblings([event for event, _claim_id in carried.siblings])
-            return
-        if carried.identity is not None:
-            with self._completion_delivery_lock:
-                self._completion_deliveries_inflight.discard(carried.identity)
-        evt = {k: v for k, v in carried.evt.items() if k != "completion_ids"}
-        for event in (evt, *(sibling for sibling, _claim_id in carried.siblings)):
-            _pr.completion_queue.put(event)
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
