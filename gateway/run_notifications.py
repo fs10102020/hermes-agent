@@ -23,6 +23,7 @@ from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
+from gateway.run_notifications_busy_result import GatewayBusyResultMixin
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
 
@@ -152,7 +153,6 @@ class _CarriedCompletion:
     claim_id: str
     identity: Any
     siblings: tuple
-    waiter: Optional[asyncio.Future] = None  # a process completion's carry outcome
 
 
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
@@ -182,7 +182,9 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     return metadata
 
 
-class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin):
+class GatewayNotificationsMixin(
+    GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayBusyResultMixin,
+):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
@@ -895,7 +897,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         ``True`` on adapter acceptance, ``False`` on retryable adapter failure, ``None`` with no
         gateway route or a refused notice pinned to a permanently-gone session (``_watch_pin_gone``).
         Not transactional: a crash after acceptance can replay (at-least-once).
+
+        A process completion whose session has a running turn may be carried into that turn instead
+        (``display.background_process_busy_result_mode: steer``); this is the funnel both delivery
+        paths reach, so the offer is made here.
         """
+        if await self._carry_process_completion_into_running_turn(synth_text, evt):
+            return True
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
@@ -1275,14 +1283,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
             evt = {**evt, "completion_ids": completion_ids}
-            carry = self._carry_completion_into_running_turn(synth_text, evt, claim, identity, sibling_claims)
-            if carry is True:
+            if self._carry_completion_into_running_turn(synth_text, evt, claim, identity, sibling_claims):
                 carried = True  # the running turn's tool result delivers it; claims settle there
                 return True
-            if not carry or not await carry:  # a process completion no tool result carried: queue it
-                injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
-                if injection_result is not True:
-                    return injection_result
+            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            if injection_result is not True:
+                return injection_result
             accepted = True
             if identity is not None:
                 with self._completion_delivery_lock:
@@ -1308,92 +1314,24 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 if accepted and sibling_claims:
                     self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 
-    def _busy_result_mode(self, evt_type: str) -> str:
-        """The profile in scope's busy-result mode for ``evt_type``: ``queue`` (default) or ``steer``."""
-        from gateway.run import _load_gateway_config
-        from gateway.run_notifications_busy_result import BUSY_RESULT_MODE_KEYS
-        from hermes_cli.config import cfg_get
-        section, key = BUSY_RESULT_MODE_KEYS[evt_type]
-        mode = str(cfg_get(_load_gateway_config(), section, key, default="") or "queue").strip().lower()
-        if mode not in ("queue", "steer"):
-            logger.warning("%s.%s=%r is not 'queue' or 'steer'; using 'queue'", section, key, mode)
-            return "queue"
-        return mode
-
     def _carry_completion_into_running_turn(self, synth_text: str, evt: dict, claim, identity, sibling_claims):
-        """``steer`` mode: hand a claimed completion to the session's running agent, which appends it
-        to its next tool result (``agent.background_results``), instead of queueing a new turn. A
-        delegation returns True and its claims stay held until ``_settle_carried_completions`` sees
-        whether a tool batch carried it; a process completion returns that outcome as a future."""
-        from gateway.run_notifications_busy_result import BUSY_RESULT_MODE_KEYS, offer_process_completion
-        if evt.get("type") not in BUSY_RESULT_MODE_KEYS or evt.get("task_failure_notice") or evt.get("origin_session_id"):
+        """``steer`` mode: hand a claimed async-delegation completion to the session's running agent,
+        which appends it to its next tool result (``agent.background_results``), instead of queueing a
+        new turn. Returns True; its claims stay held until ``_settle_carried_completions`` sees whether
+        a tool batch carried it. A process completion is claim-less and is offered by
+        ``_carry_process_completion_into_running_turn`` from ``_inject_watch_notification``."""
+        if evt.get("type") != "async_delegation" or evt.get("task_failure_notice") or evt.get("origin_session_id"):
             return False
-        from gateway.run import _AGENT_PENDING_SENTINEL
-        state = self._peek_session_state(str(evt.get("session_key") or ""))
-        agent = state.turn.agent if state is not None else None
-        if agent is None or agent is _AGENT_PENDING_SENTINEL or not callable(getattr(agent, "steer", None)):
-            return False
-        if self._busy_result_mode(evt["type"]) != "steer":
+        agent = self._busy_result_agent(evt)
+        if agent is None or self._busy_result_mode(evt["type"]) != "steer":
             return False
         from agent.background_results import offer
         carried = _CarriedCompletion(evt, claim.delegation_id, claim.claim_id, identity, tuple(sibling_claims))
         self.__dict__.setdefault("_carrying_agents", {})[id(agent)] = agent
-        if evt["type"] == "completion":
-            return offer_process_completion(agent, carried, synth_text)
         offer(agent, carried, synth_text)
         logger.info("Carrying async delegation %s into the running turn of %s",
                     claim.delegation_id or "<legacy>", evt.get("session_key"))
         return True
-
-    async def _settle_carried_completions(self, agent: Any = None, *, final: bool = False) -> None:
-        """Acknowledge completions a tool result carried; at turn end (``final``) hand the rest back
-        to the completion queue (claims deferred, no attempt spent) so they arrive as the next turn."""
-        try:
-            await self._settle_carried_completions_unguarded(agent, final=final)
-        except Exception:  # health: allow BLE001 -- runs in a turn's cleanup; the claim lease re-offers anything unsettled
-            logger.warning("Could not settle carried subagent completions", exc_info=True)
-
-    async def _settle_carried_completions_unguarded(self, agent: Any, *, final: bool) -> None:
-        from agent.background_results import take_delivered, take_outcome
-        agents = self.__dict__.get("_carrying_agents") or {}
-        if agent is not None and id(agent) not in agents:
-            return
-        for current in [agent] if agent is not None else list(agents.values()):
-            if final:
-                agents.pop(id(current), None)
-                delivered, undelivered = take_outcome(current)
-            else:
-                delivered, undelivered = take_delivered(current), []
-            for carried in delivered:
-                await self._settle_carried_completion(carried, "complete")
-            for carried, _text in undelivered:
-                await self._settle_carried_completion(carried, "defer")
-
-    async def _settle_carried_completion(self, carried: _CarriedCompletion, operation: str) -> None:
-        from tools.process_registry import process_registry as _pr
-        if carried.waiter is not None:  # a process completion: its waiting delivery call settles it
-            if not carried.waiter.done():
-                carried.waiter.set_result(operation == "complete")
-            return
-        async with self._completion_event_scope(carried.evt):
-            if carried.claim_id:
-                self._settle_durable_claim(operation, carried.delegation_id, carried.claim_id)
-            for sibling, claim_id in carried.siblings:
-                if claim_id:
-                    self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
-        if operation == "complete":
-            if carried.identity is not None:
-                with self._completion_delivery_lock:
-                    self._mark_completions_delivered_locked((carried.identity,))
-            if carried.siblings:
-                self._record_coalesced_completion_siblings([event for event, _claim_id in carried.siblings])
-            return
-        if carried.identity is not None:
-            with self._completion_delivery_lock:
-                self._completion_deliveries_inflight.discard(carried.identity)
-        evt = {k: v for k, v in carried.evt.items() if k != "completion_ids"}
-        for event in (evt, *(sibling for sibling, _claim_id in carried.siblings)):
-            _pr.completion_queue.put(event)
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:

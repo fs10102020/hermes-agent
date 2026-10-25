@@ -80,3 +80,40 @@ def test_completion_already_read_with_process_wait_is_not_shown_again(steering_r
     assert asyncio.run(_deliver_while_busy(runner, agent, agent_waits_on_the_process_then_calls_a_tool)) is True
     assert messages[-1]["content"] == "tool output"
     adapter.handle_message.assert_not_awaited()
+
+
+def test_the_funnel_hook_is_guarded_to_process_completions(steering_runner):
+    """The offer sits where both delivery paths meet, but only a process completion takes it: a watch
+    hit or a heartbeat still arrives as its own turn."""
+    runner, _adapter, agent, _registry = steering_runner
+    for evt_type in ("watch_match", "heartbeat"):
+        evt = {**_completion_event(started_at=1.0), "type": evt_type}
+        assert asyncio.run(runner._carry_process_completion_into_running_turn("notice", evt)) is False
+    assert getattr(agent, "_background_result_carrier", None) is None  # nothing was offered
+
+
+def test_a_watch_match_reaching_the_funnel_still_injects_ordinarily(steering_runner):
+    """End to end through the funnel: steer mode is on and the session is busy, yet a watch hit takes
+    the ordinary admission path and offers nothing to the running turn."""
+    runner, adapter, agent, _registry = steering_runner
+    evt = {**_completion_event(started_at=1.0), "type": "watch_match", "pattern": "READY"}
+
+    async def inject():
+        # Bounded: if the guard regressed, the failure is a clean timeout, not a hung test run.
+        return await asyncio.wait_for(runner._inject_watch_notification("watch hit", evt), 5)
+
+    assert asyncio.run(inject()) is True
+    adapter.handle_message.assert_awaited_once()
+    assert getattr(agent, "_background_result_carrier", None) is None
+
+
+def test_the_process_carry_is_claim_less_and_the_delegation_carry_keeps_its_identity_fields():
+    """Two carry types, not one class with optional fields: the process path owns no durable row."""
+    import dataclasses
+
+    from gateway.run_notifications import _CarriedCompletion
+    from gateway.run_notifications_busy_result import _CarriedProcessCompletion
+
+    assert [field.name for field in dataclasses.fields(_CarriedProcessCompletion)] == ["evt", "waiter"]
+    assert [field.name for field in dataclasses.fields(_CarriedCompletion)] == [
+        "evt", "delegation_id", "claim_id", "identity", "siblings"]
