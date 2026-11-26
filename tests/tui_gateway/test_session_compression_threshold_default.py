@@ -68,3 +68,25 @@ def test_invalid_threshold_still_warns(caplog):
 
     assert agent.codex_responses_compact_threshold == 200_000
     assert "Invalid compression.codex_responses_compact_threshold" in caplog.text
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_non_positive_threshold_warns_and_falls_back(caplog, bad):
+    """A threshold that cannot be a token count is a real mistake: warn and use the default."""
+    agent = _agent()
+
+    _apply_live_compression_config(agent, {"compression": {"codex_responses_compact_threshold": bad}})
+
+    assert agent.codex_responses_compact_threshold == 200_000
+    assert "Invalid compression.codex_responses_compact_threshold" in caplog.text
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_bool_threshold_is_invalid_not_an_int(caplog, bad):
+    """``True``/``False`` are ints in Python (1/0); they must not be read as a token count."""
+    agent = _agent()
+
+    _apply_live_compression_config(agent, {"compression": {"codex_responses_compact_threshold": bad}})
+
+    assert agent.codex_responses_compact_threshold == 200_000
+    assert "Invalid compression.codex_responses_compact_threshold" in caplog.text
