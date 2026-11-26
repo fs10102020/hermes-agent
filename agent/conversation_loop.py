@@ -1616,6 +1616,18 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _reopen_notification_queue(agent) -> None:
+    """Re-open the mid-turn notification queue at turn start.
+
+    The previous turn closed it in its finalizer. Re-opening discards nothing: a notice still
+    queued here was refused a boundary by a turn that never reached its finalizer (an exception or
+    cancellation path), and it must stay deliverable rather than stranded on this agent.
+    """
+    reopen = getattr(agent, "_open_notification_queue", None)
+    if callable(reopen):
+        reopen()
+
+
 def _run_conversation_turn(
     agent,
     user_message: Any,
@@ -1653,6 +1665,11 @@ def _run_conversation_turn(
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
+
+    # Re-open the mid-turn notification queue: the previous turn closed it at its finalizer, and a
+    # notice refused in that window (or left by a turn that never reached the finalizer) must be
+    # deliverable again rather than stranded on this agent.
+    _reopen_notification_queue(agent)
 
     # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
     # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
